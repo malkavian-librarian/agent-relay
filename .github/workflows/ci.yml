@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  IMAGE_NAME: agent-relay
+
+jobs:
+  # Gate: starter suite (SQLite) + Q2 integration flow (PostgreSQL).
+  # build-and-deploy runs only if this job passes (needs: [test]).
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi sqlalchemy "uvicorn[standard]" pydantic-settings "psycopg[binary]" httpx pytest
+
+      - name: Starter tests (SQLite scratch DB)
+        env:
+          RELAY_DATABASE_URL: "sqlite:////tmp/agent-relay-test.db"
+        run: pytest -q
+
+      - name: Integration test against PostgreSQL (Q2 flow)
+        env:
+          RELAY_DATABASE_URL: "postgresql+psycopg://relay:relay@localhost:5432/relay"
+        run: |
+          python - <<'EOF'
+          from fastapi.testclient import TestClient
+          import main
+          from database import Base, engine
+          Base.metadata.drop_all(engine)
+          Base.metadata.create_all(engine)
+          c = TestClient(main.app)
+
+          sender = c.post("/api/v1/agents", json={"name": "sender"}).json()
+          recipient = c.post("/api/v1/agents", json={"name": "recipient"}).json()
+          task = c.post("/api/v1/tasks",
+                        headers={"Authorization": f"Bearer {sender['token']}"},
+                        json={"to": recipient["agent_id"], "input": "hello relay"})
+          assert task.status_code == 201, task.text
+          task = task.json()
+          assert task["status"] == "queued"
+          claim = c.post("/api/v1/tasks/claim",
+                         headers={"Authorization": f"Bearer {recipient['token']}"},
+                         json={"worker_id": "w-1", "wait_seconds": 0}).json()
+          done = c.post(f"/api/v1/tasks/{task['task_id']}/complete",
+                        headers={"Authorization": f"Bearer {recipient['token']}"},
+                        json={"claim_token": claim["claim_token"], "output": "HELLO RELAY"})
+          assert done.status_code == 200, done.text
+          seen = c.get(f"/api/v1/tasks/{task['task_id']}",
+                       headers={"Authorization": f"Bearer {sender['token']}"}).json()
+          assert seen["status"] == "completed", seen
+          assert seen["output"] == "HELLO RELAY", seen
+          dash = c.get("/")
+          assert dash.status_code == 200
+          print("integration flow OK on PostgreSQL; sender sees:", seen["status"])
+          EOF
+
+  build-and-deploy:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image with unique tag
+        run: |
+          TAG="${GITHUB_SHA}"
+          docker build -t "${IMAGE_NAME}:${TAG}" .
+          echo "IMAGE_TAG=${TAG}" >> "${GITHUB_ENV}"
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: agent-relay
+
+      - name: Configure cluster access and load image into kind
+        run: |
+          kubectl cluster-info
+          kind load docker-image "${IMAGE_NAME}:${IMAGE_TAG}" --name agent-relay
+
+      - name: Deploy to kind and wait for rollout
+        run: |
+          kubectl apply -f k8s/
+          kubectl set image deployment/agent-relay "api=${IMAGE_NAME}:${IMAGE_TAG}"
+          kubectl rollout status deployment/agent-relay --timeout=180s
+          kubectl get pods
